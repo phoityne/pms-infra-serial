@@ -138,27 +138,38 @@ genSerialOpenTask cmdDat = do
   let argsBS   = DM.unRawJsonByteString $ cmdDat^.DM.argumentsSerialOpenCommandData
 
   resQ <- view DM.responseQueueDomainData <$> lift ask
-  serialMVar <- view serialAppData <$> ask
+  serialMVar <- view handleAppData <$> ask
+  prompts <- view DM.promptsDomainData <$> lift ask
+  lockTMVar <- view lockAppData <$> ask
   argsDat <- liftEither $ eitherDecode $ argsBS
+
+
   let device = argsDat^.deviceSerialToolParams
       speed  = argsDat^.speedSerialToolParams
 
   settings <- getSerialSetting speed
   $logDebugS DM._LOGTAG $ T.pack $ "genSerialOpenTask: cmd. " ++ device ++ ":" ++ show settings
  
-  return $ serialOpenTask cmdDat resQ serialMVar device settings
+  return $ serialOpenTask cmdDat resQ serialMVar lockTMVar prompts device settings
 
 
 -- |
 --   
 serialOpenTask :: DM.SerialOpenCommandData
               -> STM.TQueue DM.McpResponse
-              -> STM.TMVar (Maybe SerialPort)
-              -> String
+              -> STM.TMVar (Maybe Handle)
+              -> STM.TMVar ()  -- lock
+              -> [String]      -- prompt list
+              -> String        -- device
               -> SerialPortSettings
               -> IOTask ()
-serialOpenTask cmdDat resQ serialVar device settings = do
+serialOpenTask cmdDat resQ serialVar lockTMVar prompts device settings = do
   hPutStrLn stderr $ "[INFO] PMS.Infra.Serial.DS.Core.serialOpenTask start. "
+  let waitmicro = 100000
+      readsize = 1024
+      tout = DM._TIMEOUT_MICROSEC
+      promptAdded = prompts ++ ["login:"]
+      jsonRpc = cmdDat^.DM.jsonrpcSerialOpenCommandData
 
   STM.atomically (STM.takeTMVar serialVar) >>= \case
     Just p -> do
@@ -166,9 +177,22 @@ serialOpenTask cmdDat resQ serialVar device settings = do
       hPutStrLn stderr "[ERROR] PMS.Infrastructure.DS.Core.serialOpenTask: serial is already connected."
       toolsCallResponse resQ (cmdDat^.DM.jsonrpcSerialOpenCommandData) (ExitFailure 1) "" "serial is already running."
     Nothing -> flip E.catchAny errHdl $ do
-      serialp <- createSerialPort device settings
-      STM.atomically $ STM.putTMVar serialVar (Just serialp)
-      toolsCallResponse resQ (cmdDat^.DM.jsonrpcSerialOpenCommandData) ExitSuccess ("serial connected to " ++ device ++ ":" ++ show settings) ""
+      hPutStrLn stderr $ "[INFO] PMS.Infra.Serial.DS.Core.serialOpenTask end." ++ (show settings)
+      serialhdl <- createSerialPort device settings
+      writeSerialPort serialhdl $ BS8.pack $ DM._CR
+      CC.threadDelay waitmicro
+
+      STM.atomically $ STM.putTMVar serialVar (Just serialhdl)
+      hPutStrLn stderr $ "[INFO] PMS.Infra.Serial.DS.Core.serialOpenTask end. serial connected to " ++ device ++ ":" ++ show settings
+
+  STM.atomically (STM.readTMVar serialVar) >>= \case
+    Nothing -> do
+      hPutStrLn stderr "[ERROR] PMS.Infra.Serial.DS.Core.serialOpenTask: serial is not started."
+      toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "serial is not started."
+    Just serialhdl -> do
+      race (DM.expect lockTMVar (readSizeSerialPort serialhdl readsize) promptAdded) (CC.threadDelay tout) >>= \case
+        Left res -> toolsCallResponse resQ jsonRpc ExitSuccess (maybe "Nothing" id res) ""
+        Right _  -> toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "timeout occurred."
 
   hPutStrLn stderr "[INFO] PMS.Infra.Serial.DS.Core.serialOpenTask end."
 
@@ -184,7 +208,7 @@ serialOpenTask cmdDat resQ serialVar device settings = do
 genSerialCloseTask :: DM.SerialCloseCommandData -> AppContext (IOTask ())
 genSerialCloseTask dat = do
   $logDebugS DM._LOGTAG $ T.pack $ "genSerialCloseTask called. "
-  serialTMVar <- view serialAppData <$> ask
+  serialTMVar <- view handleAppData <$> ask
   resQ <- view DM.responseQueueDomainData <$> lift ask
   return $ serialCloseTask dat resQ serialTMVar
 
@@ -192,7 +216,7 @@ genSerialCloseTask dat = do
 --
 serialCloseTask :: DM.SerialCloseCommandData
                   -> STM.TQueue DM.McpResponse
-                  -> STM.TMVar (Maybe SerialPort)
+                  -> STM.TMVar (Maybe Handle)
                   -> IOTask ()
 serialCloseTask cmdDat resQ serialTMVar = flip E.catchAny errHdl $ do
   hPutStrLn stderr $ "[INFO] PMS.Infra.Serial.DS.Core.serialCloseTask run. "
@@ -202,8 +226,8 @@ serialCloseTask cmdDat resQ serialTMVar = flip E.catchAny errHdl $ do
     Nothing -> do
       hPutStrLn stderr "[ERROR] PMS.Infra.Serial.DS.Core.serialCloseTask: serial is not started."
       toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "serial is not started."
-    Just serialp -> do
-      closeSerial serialp
+    Just serialhdl -> do
+      hClose serialhdl
       toolsCallResponse resQ jsonRpc ExitSuccess "" "serial is teminated."
       hPutStrLn stderr $ "[INFO] PMS.Infra.Serial.DS.Core.serialCloseTask closeSerial : "
 
@@ -223,7 +247,7 @@ genSerialReadTask cmdData = do
   let argsBS = DM.unRawJsonByteString $ cmdData^.DM.argumentsSerialReadCommandData
       tout = 30 * 1000 * 1000
   resQ <- view DM.responseQueueDomainData <$> lift ask
-  serialTMVar <- view serialAppData <$> ask
+  serialTMVar <- view handleAppData <$> ask
   argsDat <- liftEither $ eitherDecode $ argsBS
   let size = argsDat^.sizeSerialIntToolParams
 
@@ -234,7 +258,7 @@ genSerialReadTask cmdData = do
 --
 serialReadTask :: DM.SerialReadCommandData
                 -> STM.TQueue DM.McpResponse
-                -> STM.TMVar (Maybe SerialPort)
+                -> STM.TMVar (Maybe Handle)
                 -> Int       -- read size.
                 -> Int       -- timeout microsec
                 -> IOTask ()
@@ -256,9 +280,9 @@ serialReadTask cmdDat resQ serialTMVar size tout = flip E.catchAny errHdl $ do
     errHdl :: E.SomeException -> IO ()
     errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
-    go :: SerialPort -> IO ()
-    go serialp =
-      race (readSizeSerialPort serialp size) (CC.threadDelay tout) >>= \case
+    go :: Handle -> IO ()
+    go serialhdl =
+      race (readSizeSerialPort serialhdl size) (CC.threadDelay tout) >>= \case
         Left res -> toolsCallResponse resQ jsonRpc ExitSuccess (bytesToHex res) ""
         Right _  -> toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "timeout occurred."
 
@@ -269,7 +293,7 @@ genSerialWriteTask :: DM.SerialWriteCommandData -> AppContext (IOTask ())
 genSerialWriteTask cmdData = do
   let argsBS = DM.unRawJsonByteString $ cmdData^.DM.argumentsSerialWriteCommandData
   resQ <- view DM.responseQueueDomainData <$> lift ask
-  serialTMVar <- view serialAppData <$> ask
+  serialTMVar <- view handleAppData <$> ask
   argsDat <- liftEither $ eitherDecode $ argsBS
   let args = argsDat^.dataSerialWord8ArrayToolParams
 
@@ -280,7 +304,7 @@ genSerialWriteTask cmdData = do
 --
 serialWriteTask :: DM.SerialWriteCommandData
                 -> STM.TQueue DM.McpResponse
-                -> STM.TMVar (Maybe SerialPort)
+                -> STM.TMVar (Maybe Handle)
                 -> [Word8]
                 -> IOTask ()
 serialWriteTask cmdDat resQ serialTMVar args = flip E.catchAny errHdl $ do
@@ -301,13 +325,13 @@ serialWriteTask cmdDat resQ serialTMVar args = flip E.catchAny errHdl $ do
     errHdl :: E.SomeException -> IO ()
     errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
-    go :: SerialPort -> IO ()
-    go serialp = do
+    go :: Handle -> IO ()
+    go serialhdl = do
       let bsDat = B.pack args
 
       hPutStrLn stderr $ "[INFO] PMS.Infra.Serial.DS.Core.serialWriteTask writeSerial (hex): " ++ bytesToHex bsDat
 
-      writeSerialPort serialp bsDat
+      writeSerialPort serialhdl bsDat
 
       toolsCallResponse resQ jsonRpc ExitSuccess ("write data to serial. "++ bytesToHex bsDat) ""
 
@@ -320,7 +344,7 @@ genSerialMessageTask cmdData = do
       tout = DM._TIMEOUT_MICROSEC
   prompts <- view DM.promptsDomainData <$> lift ask
   resQ <- view DM.responseQueueDomainData <$> lift ask
-  serialTMVar <- view serialAppData <$> ask
+  serialTMVar <- view handleAppData <$> ask
   lockTMVar <- view lockAppData <$> ask
   argsDat <- liftEither $ eitherDecode $ argsBS
   let args = argsDat^.argumentsSerialStringToolParams
@@ -332,7 +356,7 @@ genSerialMessageTask cmdData = do
 --
 serialMessageTask :: DM.SerialMessageCommandData
                 -> STM.TQueue DM.McpResponse
-                -> STM.TMVar (Maybe SerialPort)
+                -> STM.TMVar (Maybe Handle)
                 -> STM.TMVar ()
                 -> String  -- arguments line
                 -> [String]  -- prompt list
@@ -356,84 +380,19 @@ serialMessageTask cmdDat resQ serialTMVar lockTMVar args prompts tout = flip E.c
     errHdl :: E.SomeException -> IO ()
     errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
-    go :: SerialPort -> IO ()
-    go serialp = do
+    go :: Handle -> IO ()
+    go serialhdl = do
 
       msg <- DM.validateMessage args
       let cmd = TE.encodeUtf8 $ T.pack $ msg ++ DM._CR
-
+          waitmicro = 100000
+          size = 1024
       hPutStrLn stderr $ "[INFO] PMS.Infra.Serial.DS.Core.serialMessageTask writeSerial : " ++ BS8.unpack cmd
 
-      writeSerialPort serialp cmd
-
-      race (DM.expect lockTMVar (readTelnetSerialPort serialp) prompts) (CC.threadDelay tout) >>= \case
+      writeSerialPort serialhdl cmd
+      CC.threadDelay waitmicro
+      race (DM.expect lockTMVar (readSizeSerialPort serialhdl size) prompts) (CC.threadDelay tout) >>= \case
         Left res -> toolsCallResponse resQ jsonRpc ExitSuccess (maybe "Nothing" id res) ""
         Right _  -> toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "timeout occurred."
 
 
-{-
--- |
---
-genSerialTelnetTask :: DM.SerialTelnetCommandData -> AppContext (IOTask ())
-genSerialTelnetTask cmdDat = do
-  let argsBS   = DM.unRawJsonByteString $ cmdDat^.DM.argumentsSerialTelnetCommandData
-      tout     = DM._TIMEOUT_MICROSEC
-
-  prompts <- view DM.promptsDomainData <$> lift ask
-  resQ <- view DM.responseQueueDomainData <$> lift ask
-  serialMVar <- view serialAppData <$> ask
-  lockTMVar <- view lockAppData <$> ask
-
-  argsDat <- liftEither $ eitherDecode $ argsBS
-  let device = argsDat^.deviceSerialToolParams
-      speed = argsDat^.speedSerialToolParams
-      addPrompts = ["login:"]
-
-  settings <- getSerialSetting speed
-
-  $logDebugS DM._LOGTAG $ T.pack $ "genSerialTelnetTask: cmd. " ++ device ++ ":" ++ show settings
- 
-  return $ serialTelnetTask cmdDat resQ serialMVar lockTMVar device settings (prompts++addPrompts) tout
-
-
--- |
---   
-serialTelnetTask :: DM.SerialTelnetCommandData
-              -> STM.TQueue DM.McpResponse
-              -> STM.TMVar (Maybe SerialPort)
-              -> STM.TMVar ()
-              -> String
-              -> SerialPortSettings
-              -> [String]
-              -> Int
-              -> IOTask ()
-serialTelnetTask cmdDat resQ serialVar lockTMVar device settings prompts tout = do
-  hPutStrLn stderr $ "[INFO] PMS.Infra.Serial.DS.Core.serialTelnetTask start. "
-
-  STM.atomically (STM.takeTMVar serialVar) >>= \case
-    Just p -> do
-      STM.atomically $ STM.putTMVar serialVar $ Just p
-      hPutStrLn stderr "[ERROR] PMS.Infrastructure.DS.Core.serialTelnetTask: serial is already connected."
-      toolsCallResponse resQ (cmdDat^.DM.jsonrpcSerialTelnetCommandData) (ExitFailure 1) "" "serial is already running."
-    Nothing -> flip E.catchAny errHdl $ do
-      serialp <- createSerialPort device settings
-      STM.atomically $ STM.putTMVar serialVar (Just serialp)
-
-  STM.atomically (STM.readTMVar serialVar) >>= \case
-    Just p -> race (DM.expect lockTMVar (readTelnetSerialPort p) prompts) (CC.threadDelay tout) >>= \case
-      Left res -> toolsCallResponse resQ (cmdDat^.DM.jsonrpcSerialTelnetCommandData) ExitSuccess (maybe "Nothing" id res) ""
-      Right _  -> toolsCallResponse resQ (cmdDat^.DM.jsonrpcSerialTelnetCommandData) (ExitFailure 1) "" "timeout occurred."
-    Nothing -> do
-      hPutStrLn stderr "[ERROR] PMS.Infrastructure.DS.Core.serialTelnetTask: unexpected. serial not found."
-      toolsCallResponse resQ (cmdDat^.DM.jsonrpcSerialTelnetCommandData) (ExitFailure 1) "" "unexpected. serial not found."
-
-  hPutStrLn stderr "[INFO] PMS.Infra.Serial.DS.Core.serialTelnetTask end."
-
-  where
-    errHdl :: E.SomeException -> IO ()
-    errHdl e = do
-      STM.atomically $ STM.putTMVar serialVar Nothing
-      hPutStrLn stderr $ "[ERROR] PMS.Infra.Serial.DS.Core.serialTelnetTask: exception occurred. " ++ show e
-      toolsCallResponse resQ (cmdDat^.DM.jsonrpcSerialTelnetCommandData) (ExitFailure 1) "" (show e)
-
--}

@@ -9,8 +9,8 @@ import Control.Lens
 import Data.Default
 import Data.Aeson.TH
 import qualified Control.Concurrent.STM as STM
-import System.Hardware.Serialport
 import Data.Word 
+import System.IO 
 
 import qualified PMS.Domain.Model.DM.Type as DM
 import qualified PMS.Domain.Model.DM.TH as DM
@@ -18,7 +18,7 @@ import qualified PMS.Domain.Model.DM.TH as DM
 -- |
 --
 data AppData = AppData {
-               _serialAppData :: STM.TMVar (Maybe SerialPort)
+               _handleAppData :: STM.TMVar (Maybe Handle)
              , _lockAppData :: STM.TMVar ()
              , _jsonrpcAppData :: DM.JsonRpcRequest
              }
@@ -30,7 +30,7 @@ defaultAppData = do
   mgrVar <- STM.newTMVarIO Nothing
   lock    <- STM.newTMVarIO ()
   return AppData {
-           _serialAppData = mgrVar
+           _handleAppData = mgrVar
          , _lockAppData = lock
          , _jsonrpcAppData = def
          }
