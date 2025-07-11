@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 module PMS.Infra.Serial.App.Control where
 
 import System.IO

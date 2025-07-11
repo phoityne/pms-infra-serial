@@ -1,6 +1,7 @@
 # pms-infra-serial
 
-`pms-infra-serial` is a library within the [`pty-mcp-server`](https://github.com/phoityne/pty-mcp-server) project.  
+pms-infra-serial is a Haskell module responsible for handling serial communication on top of [`pty-mcp-server`](https://github.com/phoityne/pty-mcp-server).
+It provides an abstraction layer for input/output control over serial connections to network devices and embedded systems, serving as a foundation for AI-driven interactive automation.
 
 
 ---
